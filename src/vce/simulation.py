@@ -9,7 +9,7 @@ import scipy.stats
 
 import numpy as np
 
-from .core import HelmertVCE, LSVCE, LSVCEPlus
+from vce.core import HelmertVCE, LSVCE, LSVCEPlus
 
 
 @dataclass
