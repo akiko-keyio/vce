@@ -30,16 +30,15 @@ def orthogonal_projector(
     """Return P = A(AᵀQ⁻¹A)⁻¹AᵀQ⁻¹ and P_perp = I − P."""
     At = A.T
     N = At @ Q_inv @ A
-    N_inv = np.linalg.inv(N)
-    P = A @ (N_inv @ (At @ Q_inv))
+    # Avoid forming the inverse explicitly for better performance
+    M = np.linalg.solve(N, At @ Q_inv)
+    P = A @ M
     return P, np.eye(A.shape[0]) - P
 
 
 def trace_of_product(*mats: np.ndarray) -> float:
-    """Compute trace(M₁⋯Mₙ) with chained multiplications."""
-    prod = mats[0]
-    for M in mats[1:]:
-        prod = prod @ M
+    """Return ``trace(M₁⋯Mₙ)`` using ``multi_dot`` for speed."""
+    prod = np.linalg.multi_dot(mats)
     return float(np.trace(prod))
 
 
