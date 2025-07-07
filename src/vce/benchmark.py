@@ -1,150 +1,169 @@
 #!/usr/bin/env python3
-"""Lightweight benchmark runner for VCE Monte‑Carlo tests.
+"""benchmark.py — concise Monte‑Carlo benchmark with *summary metrics*
 
-Compared with the previous *benchmark.py*, this script **trades breadth for
-speed** so that a full run finishes in ≲ 3 min on a laptop (≈ 8 cores).
+Runs a reduced‑size Monte‑Carlo experiment for several (m, r_dim) scenarios,
+computes the full `Metrics` suite (bias, variance, χ² p‑value …) for every
+estimator, and saves a single CSV whose **one row = one estimator × scenario**.
 
-Main simplifications
---------------------
-* **Scenario grid** reduced to 2×2×2 = 8 combos:
-  m ∈ {120, 240}, r ∈ {4, 6}, block pattern ∈ {"333", "336"}.
-  (Blocks "246" & SNR scaling removed.)
-* **Trials per scenario** default 300 — adequate to see bias & variance order.
-* **Parallel limit** automatically caps at min(4, CPU) unless user overrides.
-* Added **--quick** preset: runs *only 120×4* with 100 trials (~5 s) for CI.
+Key changes v.s. the old per‑trial logger
+----------------------------------------
+* **Much lighter workload**
+  * scenarios: m ∈ [30, 60, 120]  (max matrix 120×120)
+  * default ``--trial-base 50``        → ≤ 7 500 total trials
+* **Summary instead of raw trials** – easier to read; one glance shows which
+  estimator is best.
+* Pure *map‑reduce* layout – no shared queue needed; keeps Windows compatibility
+  without the previous Manager/Queue plumbing.
 
 Usage examples
 --------------
-    # Normal lightweight run (~ 1 min)
-    python -m vce.benchmark_light
-
-    # Quick sanity check (single scenario) – finishes in seconds
-    python -m vce.benchmark_light --quick
-
-    # Custom trials & workers
-    python -m vce.benchmark_light --trials 500 --processes 6
+```bash
+python benchmark.py                            # default lightweight run
+python benchmark.py --trial-base 200 -p 6      # deeper stats, 6 processes
+```
+The script prints a Markdown‑ready table to stdout **and** writes a CSV
+(`vce_summary.csv` by default).
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import multiprocessing as mp
-from itertools import product
+from dataclasses import asdict
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 
 import numpy as np
 from tqdm import tqdm
 
-from vce.simulation import Scenario, monte_carlo, evaluate
+from vce.simulation import (
+    Scenario,
+    monte_carlo,
+    evaluate,
+)
 
 # ---------------------------------------------------------------------------
-# Scenario factory -----------------------------------------------------------
+# Scenario generator (lightweight) ------------------------------------------
 
-
-def make_scenarios(n_trials: int, seeds: List[int], quick: bool) -> List[Scenario]:
-    if quick:
-        return [
-            Scenario(
-                m=120,
-                r_dim=4,
-                block_sizes=(40, 40, 40),
-                sigma_true=(5.0, 2.0, 1.0),
-                n_trials=n_trials,
-                seed=seeds[0],
-            )
-        ]
-
-    m_choices = [120, 240]
-    r_choices = [4, 6]
-    block_patterns = {"333": (40, 40, 40), "336": (30, 30, 60)}
-    sigma_true = np.array([5.0, 2.0, 1.0])
-
+def make_scenarios(trial_base: int) -> List[Scenario]:
+    """Return a small list of Scenario objects with scaled trial counts."""
+    m_list = [30, 60, 120]              # max 120×120 ⇒ ultra‑fast
     scenarios: List[Scenario] = []
-    for (m, r_dim, pattern_key, seed) in product(
-        m_choices, r_choices, block_patterns, seeds
-    ):
+    for m in m_list:
+        r_dim = max(2, round(m / 30))
+        block = (m // 3, m // 3, m - 2 * (m // 3))
+        trials = trial_base * (120 // m)  # keep ~constant total obs per m
         scenarios.append(
             Scenario(
                 m=m,
                 r_dim=r_dim,
-                block_sizes=block_patterns[pattern_key],
-                sigma_true=sigma_true,
-                n_trials=n_trials,
-                seed=seed,
+                block_sizes=block,
+                sigma_true=(5.0, 2.0, 1.0),
+                n_trials=trials,
+                seed=m,  # deterministic but distinct
             )
         )
     return scenarios
 
 # ---------------------------------------------------------------------------
-# Worker ---------------------------------------------------------------------
+# Worker – run one Scenario, summarise Metrics ------------------------------
 
-
-def run_one(scn: Scenario):
-    res = monte_carlo(scn)
-    metrics = evaluate(res, scn.sigma_true, scn.m, scn.r_dim)
-    return scn, metrics
+def scenario_worker(scn: Scenario) -> Dict[str, Any]:
+    """Run monte‑carlo + evaluation for one Scenario; return serialisable dict."""
+    results = monte_carlo(scn)
+    metrics = evaluate(results, scn.sigma_true, scn.m, scn.r_dim)
+    out: Dict[str, Any] = {
+        "m": scn.m,
+        "r_dim": scn.r_dim,
+        "block": scn.block_sizes,
+    }
+    # flatten every Metrics dataclass into separate keys
+    for est_name, met in metrics.items():
+        d = asdict(met)
+        # numpy arrays → python lists for csv/json friendliness
+        for k, v in d.items():
+            if isinstance(v, np.ndarray):
+                d[k] = v.tolist()
+        out[est_name] = d
+    return out
 
 # ---------------------------------------------------------------------------
-# Main -----------------------------------------------------------------------
+# CSV helpers ---------------------------------------------------------------
 
+METRIC_FIELDS = [
+    "bias", "variance", "rmse", "var_ratio", "cover95",
+    "chi2_p", "iter_mean", "fail_rate",
+]
 
-def main():
-    default_proc = min(4, mp.cpu_count())
-    parser = argparse.ArgumentParser(description="Run lightweight VCE benchmarks")
-    parser.add_argument("--trials", type=int, default=300, help="Monte-Carlo trials per scenario")
-    parser.add_argument("--processes", type=int, default=default_proc, help="Parallel processes")
-    parser.add_argument("--quick", action="store_true", help="Single‑scenario quick run (100 trials)")
-    parser.add_argument("--outfile", type=Path, default=Path("vce_benchmark_light.csv"), help="CSV output path")
-    args = parser.parse_args()
+CSV_HEADER: List[str] = (
+    ["estimator", "m", "r_dim", "block1", "block2", "block3"] +
+    [f"{fld}{i+1}" for fld in ["bias", "var", "rmse", "ratio", "cov"] for i in range(3)] +
+    ["chi2_p", "iter_mean", "fail_rate"]
+)
 
-    if args.quick:
-        args.trials = min(args.trials, 100)
+def metrics_to_row(est_name: str, scenario_info: Dict[str, Any]) -> List[Any]:
+    """Flatten Metrics dict of a single estimator into a CSV row."""
+    m = scenario_info["m"]
+    r_dim = scenario_info["r_dim"]
+    b1, b2, b3 = scenario_info["block"]
+    met = scenario_info[est_name]
+    row = [est_name, m, r_dim, b1, b2, b3]
+    # order: bias/var/rmse/ratio/cover (×3 each)
+    row.extend(sum([met["bias"], met["variance"], met["rmse"], met["var_ratio"], met["cover95"]], []))
+    row.extend([met["chi2_p"], met["iter_mean"], met["fail_rate"]])
+    return row
 
-    seeds = list(range(100, 100 + args.processes))
-    scenarios = make_scenarios(args.trials, seeds, args.quick)
+# ---------------------------------------------------------------------------
+# Pretty print helper -------------------------------------------------------
 
-    with mp.Pool(processes=args.processes) as pool:
-        results = list(tqdm(pool.imap_unordered(run_one, scenarios), total=len(scenarios)))
+def print_table(scenarios_data: List[Dict[str, Any]]):
+    """Dump a concise Markdown table to stdout."""
+    from tabulate import tabulate  # lightweight dep (ships with tqdm env)
 
-    with args.outfile.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "estimator",
-                "m",
-                "r_dim",
-                "blocks",
-                "trials",
-                "iter_mean",
-                "fail_rate",
-                "bias1",
-                "bias2",
-                "bias3",
-                "rmse1",
-                "rmse2",
-                "rmse3",
-                "chi2_p",
-            ]
-        )
-        for scn, metrics in results:
-            for est_name, m in metrics.items():
-                writer.writerow(
-                    [
-                        est_name,
-                        scn.m,
-                        scn.r_dim,
-                        ",".join(map(str, scn.block_sizes)),
-                        scn.n_trials,
-                        f"{m.iter_mean:.2f}",
-                        f"{m.fail_rate:.3f}",
-                        *[f"{x:.4f}" for x in m.bias],
-                        *[f"{x:.4f}" for x in m.rmse],
-                        f"{m.chi2_p:.4f}",
-                    ]
-                )
-    print(f"Done. Results -> {args.outfile}")
+    rows = []
+    for scn in scenarios_data:
+        for est in ("helmert", "lsvce", "lsvce_plus"):
+            met = scn[est]
+            rows.append([
+                est,
+                scn["m"],
+                f"{met['bias'][0]:+.2f} ± {np.sqrt(met['variance'][0]):.2f}",
+                f"{met['bias'][1]:+.2f} ± {np.sqrt(met['variance'][1]):.2f}",
+                f"{met['bias'][2]:+.2f} ± {np.sqrt(met['variance'][2]):.2f}",
+                f"{met['chi2_p']:.2f}",
+                f"{met['fail_rate']*100:.1f}%",
+            ])
+    print(tabulate(rows, headers=[
+        "est", "m", "σ1 (bias±sd)", "σ2", "σ3", "χ² p", "fail"
+    ], tablefmt="github"))
 
+# ---------------------------------------------------------------------------
+# Main ----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser("VCE Monte‑Carlo benchmark (summary)")
+    parser.add_argument("--trial-base", type=int, default=300,
+                        help="Base #trials for smallest scenario (default=50)")
+    parser.add_argument("-p", "--processes", type=int,
+                        default=mp.cpu_count(),
+                        help="Worker processes (default=min(4,cpu))")
+    parser.add_argument("--outfile", type=Path, default=Path("vce_summary.csv"))
+    args = parser.parse_args()
+
+    scenarios = make_scenarios(args.trial_base)
+
+    with mp.Pool(args.processes) as pool:
+        data = list(tqdm(pool.imap_unordered(scenario_worker, scenarios),
+                         total=len(scenarios)))
+
+    # write summary CSV ------------------------------------------------------
+    with args.outfile.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_HEADER)
+        for scn in data:
+            for est in ("helmert", "lsvce", "lsvce_plus"):
+                w.writerow(metrics_to_row(est, scn))
+    print("Saved summary to", args.outfile)
+
+    # print nice table -------------------------------------------------------
+    print_table(data)

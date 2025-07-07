@@ -208,9 +208,10 @@ class LSVCEPlus(VCEBase):
             for j, Ql in enumerate(self.Q_blocks):
                 N[k, j] = trace_of_product(Qk, Wy, P_perp, Ql, Wy, P_perp)  # Eq. (52)
             # rₖ = eᵀ Wy Qk Wy e − ½ tr(Qk Wy P⊥ Q₀ Wy P⊥)  (Eq. 4.105)
-            r[k] = e @ Wy @ Qk @ Wy @ e - 0.5 * trace_of_product(
+            r[k] = e @ Wy @ Qk @ Wy @ e - trace_of_product(
                 Qk, Wy, P_perp, Q0, Wy, P_perp
             )
+
         return np.linalg.solve(N, r)
 
     def _compute_covariance(self, P_perp: np.ndarray, Q_y: np.ndarray) -> np.ndarray:
@@ -223,33 +224,3 @@ class LSVCEPlus(VCEBase):
         self.N_inv = np.linalg.inv(N)
         return self.N_inv
 
-
-# ---------------------------------------------------------------------------
-# Smoke‑test -----------------------------------------------------------------
-
-if __name__ == "__main__":
-    np.random.seed(0)
-    m, r_dim, p = 120, 4, 3
-    A = np.random.randn(m, r_dim)
-
-    Q_blocks = []
-    cursor = 0
-    for size in (40, 40, 40):
-        Qk = np.zeros((m, m))
-        Qk[cursor : cursor + size, cursor : cursor + size] = 1.0
-        Q_blocks.append(Qk)
-        cursor += size
-
-    sigma_true = np.array([5.0, 2.0, 1.0])
-    Q_true = sum(s * Q for s, Q in zip(sigma_true, Q_blocks))
-    b_true = np.array([1.2, -0.8, 0.5, 2.0])
-    y = A @ b_true + np.random.multivariate_normal(np.zeros(m), Q_true)
-
-    print("Helmert:")
-    print(HelmertVCE(A, Q_blocks).fit(y).sigma)
-
-    print("Unit‑weight LS‑VCE:")
-    print(LSVCE(A, Q_blocks).fit(y).sigma)
-
-    print("BLUE LS‑VCE (κ=0):")
-    print(LSVCEPlus(A, Q_blocks).fit(y).sigma)
