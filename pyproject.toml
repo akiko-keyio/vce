@@ -7,7 +7,11 @@ authors = [
     { name = "Aki", email = "838013444@qq.com" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "numpy>=2.2.6",
+    "plotly>=6.2.0",
+    "scipy>=1.15.3",
+]
 
 [project.scripts]
 vce = "vce:main"
@@ -15,3 +19,11 @@ vce = "vce:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+]
+
+[tool.mypy]
+ignore_missing_imports = true
