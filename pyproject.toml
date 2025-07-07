@@ -1,0 +1,17 @@
+[project]
+name = "vce"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Aki", email = "838013444@qq.com" }
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+vce = "vce:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
