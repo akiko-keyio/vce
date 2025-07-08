@@ -1,7 +1,7 @@
 """Public API for the VCE package."""
 
 from .core import HelmertVCE, LSVCE, LSVCEPlus
-from .simulation import Scenario, monte_carlo, evaluate, plot_cov_ratio
+from .simulation import Scenario, monte_carlo, evaluate
 
 __all__ = [
     "HelmertVCE",
@@ -10,7 +10,6 @@ __all__ = [
     "Scenario",
     "monte_carlo",
     "evaluate",
-    "plot_cov_ratio",
 ]
 
 

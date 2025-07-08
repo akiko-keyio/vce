@@ -1,169 +1,209 @@
 #!/usr/bin/env python3
-"""benchmark.py — concise Monte‑Carlo benchmark with *summary metrics*
+"""benchmark.py — extended Monte‑Carlo benchmark with **rich metrics**
 
-Runs a reduced‑size Monte‑Carlo experiment for several (m, r_dim) scenarios,
-computes the full `Metrics` suite (bias, variance, χ² p‑value …) for every
-estimator, and saves a single CSV whose **one row = one estimator × scenario**.
+* 4 lightweight scenarios: m ∈ {12, 30, 60, 120}
+* Per‑scenario trials scaled so total observations stay balanced.
+* Computes expanded Metrics (bias, **sd**, var, rmse, **mse**, var‑ratio,
+  cover95, χ² p, mean/median/max iterations, fail‑rate).
+* Outputs **one CSV row = one estimator × scenario**, plus a Markdown table
+  on stdout for a quick glance.
 
-Key changes v.s. the old per‑trial logger
-----------------------------------------
-* **Much lighter workload**
-  * scenarios: m ∈ [30, 60, 120]  (max matrix 120×120)
-  * default ``--trial-base 50``        → ≤ 7 500 total trials
-* **Summary instead of raw trials** – easier to read; one glance shows which
-  estimator is best.
-* Pure *map‑reduce* layout – no shared queue needed; keeps Windows compatibility
-  without the previous Manager/Queue plumbing.
-
-Usage examples
---------------
+Typical usage
+-------------
 ```bash
-python benchmark.py                            # default lightweight run
-python benchmark.py --trial-base 200 -p 6      # deeper stats, 6 processes
+python benchmark.py              # quick run (trial‑base 75 × 4 scenarios)
+python benchmark.py -p 6 --trial-base 150  # deeper stats, 6 CPU cores
 ```
-The script prints a Markdown‑ready table to stdout **and** writes a CSV
-(`vce_summary.csv` by default).
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import multiprocessing as mp
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import numpy as np
 from tqdm import tqdm
 
-from vce.simulation import (
-    Scenario,
-    monte_carlo,
-    evaluate,
-)
+from vce.simulation import Scenario, monte_carlo
 
 # ---------------------------------------------------------------------------
-# Scenario generator (lightweight) ------------------------------------------
+# Scenario generator ---------------------------------------------------------
 
 def make_scenarios(trial_base: int) -> List[Scenario]:
-    """Return a small list of Scenario objects with scaled trial counts."""
-    m_list = [30, 60, 120]              # max 120×120 ⇒ ultra‑fast
-    scenarios: List[Scenario] = []
+    """Return a list of Scenario objects with balanced trial counts."""
+    m_list = [12, 30, 60, 90]
+    out: List[Scenario] = []
     for m in m_list:
-        r_dim = max(2, round(m / 30))
+        r_dim = max(2, round(m / 3-20))
         block = (m // 3, m // 3, m - 2 * (m // 3))
-        trials = trial_base * (120 // m)  # keep ~constant total obs per m
-        scenarios.append(
+        trials = trial_base
+        out.append(
             Scenario(
                 m=m,
                 r_dim=r_dim,
                 block_sizes=block,
-                sigma_true=(5.0, 2.0, 1.0),
+                sigma_true=(5.0, 2.0, 1),
                 n_trials=trials,
-                seed=m,  # deterministic but distinct
+                seed=m,
             )
         )
-    return scenarios
-
-# ---------------------------------------------------------------------------
-# Worker – run one Scenario, summarise Metrics ------------------------------
-
-def scenario_worker(scn: Scenario) -> Dict[str, Any]:
-    """Run monte‑carlo + evaluation for one Scenario; return serialisable dict."""
-    results = monte_carlo(scn)
-    metrics = evaluate(results, scn.sigma_true, scn.m, scn.r_dim)
-    out: Dict[str, Any] = {
-        "m": scn.m,
-        "r_dim": scn.r_dim,
-        "block": scn.block_sizes,
-    }
-    # flatten every Metrics dataclass into separate keys
-    for est_name, met in metrics.items():
-        d = asdict(met)
-        # numpy arrays → python lists for csv/json friendliness
-        for k, v in d.items():
-            if isinstance(v, np.ndarray):
-                d[k] = v.tolist()
-        out[est_name] = d
     return out
 
 # ---------------------------------------------------------------------------
-# CSV helpers ---------------------------------------------------------------
+# Metric helpers -------------------------------------------------------------
 
-METRIC_FIELDS = [
-    "bias", "variance", "rmse", "var_ratio", "cover95",
-    "chi2_p", "iter_mean", "fail_rate",
-]
+def calc_metrics(res: Dict[str, Dict[str, np.ndarray]],
+                 true_sigma: List[float], m: int, r_dim: int) -> Dict[str, Dict[str, Any]]:
+    """Compute extended metrics for each estimator, tolerate NaNs."""
+    import scipy.stats
+    true = np.asarray(true_sigma, float)
+    dof = m - r_dim
+    out: Dict[str, Dict[str, Any]] = {}
+    for est, data in res.items():
+        sig = data["sigma"]
+        conv = data["converged"]
+        ok = conv & np.isfinite(sig).all(axis=1)
+        if not ok.any():
+            nan3 = [np.nan, np.nan, np.nan]
+            out[est] = dict(bias=nan3, sd=nan3, variance=nan3, rmse=nan3,
+                             mse=nan3, var_ratio=nan3, cover95=nan3,
+                             chi2_p=np.nan, iter_mean=np.nan,
+                             iter_median=np.nan, iter_max=np.nan,
+                             fail_rate=1.0)
+            continue
+        sig_ok = sig[ok]
+        cov_theo_ok = data["cov_theo"][ok]
+        chi2_vals = data["chi2"][ok]
+        n_iter = data["n_iter"][ok]
 
-CSV_HEADER: List[str] = (
-    ["estimator", "m", "r_dim", "block1", "block2", "block3"] +
-    [f"{fld}{i+1}" for fld in ["bias", "var", "rmse", "ratio", "cov"] for i in range(3)] +
-    ["chi2_p", "iter_mean", "fail_rate"]
-)
+        mean_est = sig_ok.mean(axis=0)
+        bias = mean_est - true
+        emp_cov = np.cov(sig_ok.T, ddof=1)
+        var = np.diag(emp_cov)
+        sd = np.sqrt(var)
+        rmse = np.sqrt(bias**2 + var)
+        mse = bias**2 + var
 
-def metrics_to_row(est_name: str, scenario_info: Dict[str, Any]) -> List[Any]:
-    """Flatten Metrics dict of a single estimator into a CSV row."""
-    m = scenario_info["m"]
-    r_dim = scenario_info["r_dim"]
-    b1, b2, b3 = scenario_info["block"]
-    met = scenario_info[est_name]
-    row = [est_name, m, r_dim, b1, b2, b3]
-    # order: bias/var/rmse/ratio/cover (×3 each)
-    row.extend(sum([met["bias"], met["variance"], met["rmse"], met["var_ratio"], met["cover95"]], []))
-    row.extend([met["chi2_p"], met["iter_mean"], met["fail_rate"]])
+        if cov_theo_ok.size:
+            cov_mean = cov_theo_ok.mean(axis=0)
+            var_ratio = var / np.diag(cov_mean)
+            ci = 1.96 * np.sqrt(np.diag(cov_mean))
+            cover = ((true >= mean_est - ci) & (true <= mean_est + ci)).mean(axis=0)
+        else:
+            var_ratio = cover = np.full_like(true, np.nan)
+
+        chi2_p = float(1.0 - scipy.stats.chi2.cdf(chi2_vals.mean(), dof))
+        out[est] = dict(
+            bias=bias.tolist(), sd=sd.tolist(), variance=var.tolist(),
+            rmse=rmse.tolist(), mse=mse.tolist(), var_ratio=var_ratio.tolist(),
+            cover95=cover.tolist(), chi2_p=chi2_p,
+            iter_mean=float(n_iter.mean()),
+            iter_median=float(np.median(n_iter)),
+            iter_max=float(n_iter.max()),
+            fail_rate=float(1.0 - ok.mean()),
+        )
+    return out
+
+# ---------------------------------------------------------------------------
+# Worker ---------------------------------------------------------------------
+
+def scenario_worker(scn: Scenario) -> Dict[str, Any]:
+    t0 = time.time()
+    res = monte_carlo(scn)
+    met = calc_metrics(res, scn.sigma_true, scn.m, scn.r_dim)
+    dt = time.time() - t0
+
+    info: Dict[str, Any] = {
+        "m": scn.m,
+        "r_dim": scn.r_dim,
+        "block": scn.block_sizes,
+        "runtime": dt,
+    }
+    info.update(met)
+    return info
+
+# ---------------------------------------------------------------------------
+# CSV helpers ----------------------------------------------------------------
+
+CSV_HEADER = [
+    "estimator", "m", "r_dim", "block1", "block2", "block3",
+] + [
+    f"{pfx}{i+1}" for pfx in ("bias", "sd", "variance", "rmse", "mse", "ratio", "cov") for i in range(3)
+] + [
+    "chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"
+] + [f"{pfx}{i+1}" for pfx in ("bias", "sd", "var", "rmse", "mse", "ratio", "cov") for i in range(3)] + [
+    "chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"]
+
+
+def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
+    """Flatten one estimator's metrics into a CSV row, robust to scalars."""
+    b1, b2, b3 = scn["block"]
+    m = scn[est]
+    row: List[Any] = [est, scn["m"], scn["r_dim"], b1, b2, b3]
+    for key in ("bias", "sd", "variance", "rmse", "mse", "var_ratio", "cover95"):
+        v = m[key]
+        # ensure iterable
+        if isinstance(v, (list, tuple)):
+            row.extend(v)
+        else:
+            row.append(v)
+    row.extend([
+        m["chi2_p"], m["iter_mean"], m["iter_median"], m["iter_max"], m["fail_rate"], scn["runtime"],
+    ])
     return row
 
 # ---------------------------------------------------------------------------
-# Pretty print helper -------------------------------------------------------
+# Pretty table ---------------------------------------------------------------
 
-def print_table(scenarios_data: List[Dict[str, Any]]):
-    """Dump a concise Markdown table to stdout."""
-    from tabulate import tabulate  # lightweight dep (ships with tqdm env)
+def print_table(datas: List[Dict[str, Any]]):
+    try:
+        from tabulate import tabulate
+    except ImportError:
+        print("(install `tabulate` for nicer tables)\n")
+        return
 
     rows = []
-    for scn in scenarios_data:
+    for d in datas:
         for est in ("helmert", "lsvce", "lsvce_plus"):
-            met = scn[est]
+            m = d[est]
             rows.append([
-                est,
-                scn["m"],
-                f"{met['bias'][0]:+.2f} ± {np.sqrt(met['variance'][0]):.2f}",
-                f"{met['bias'][1]:+.2f} ± {np.sqrt(met['variance'][1]):.2f}",
-                f"{met['bias'][2]:+.2f} ± {np.sqrt(met['variance'][2]):.2f}",
-                f"{met['chi2_p']:.2f}",
-                f"{met['fail_rate']*100:.1f}%",
+                est, d["m"],
+                f"{m['bias'][0]:+.2f} ± {m['sd'][0]:.2f}",
+                f"{m['bias'][1]:+.2f} ± {m['sd'][1]:.2f}",
+                f"{m['bias'][2]:+.2f} ± {m['sd'][2]:.2f}",
+                f"{m['chi2_p']:.2f}",
+                f"{m['fail_rate']*100:.1f}%",
+                f"{m['iter_mean']:.1f}",
             ])
-    print(tabulate(rows, headers=[
-        "est", "m", "σ1 (bias±sd)", "σ2", "σ3", "χ² p", "fail"
-    ], tablefmt="github"))
+    print(tabulate(rows, headers=["est", "m", "σ1 (bias±sd)", "σ2", "σ3", "χ² p", "fail", "iter¯"], tablefmt="github"))
 
 # ---------------------------------------------------------------------------
-# Main ----------------------------------------------------------------------
+# Main -----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("VCE Monte‑Carlo benchmark (summary)")
-    parser.add_argument("--trial-base", type=int, default=300,
-                        help="Base #trials for smallest scenario (default=50)")
-    parser.add_argument("-p", "--processes", type=int,
-                        default=mp.cpu_count(),
-                        help="Worker processes (default=min(4,cpu))")
-    parser.add_argument("--outfile", type=Path, default=Path("vce_summary.csv"))
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trial-base", type=int, default=10000,
+                    help="Base trial count for smallest m (default 75)")
+    ap.add_argument("-p", "--processes", type=int, default=mp.cpu_count(),
+                    help="Worker processes (default=min(4,cpu))")
+    ap.add_argument("--outfile", type=Path, default="vce_lsummary.csv")
+    args = ap.parse_args()
 
-    scenarios = make_scenarios(args.trial_base)
-
+    scens = make_scenarios(args.trial_base)
     with mp.Pool(args.processes) as pool:
-        data = list(tqdm(pool.imap_unordered(scenario_worker, scenarios),
-                         total=len(scenarios)))
+        data = list(tqdm(pool.imap_unordered(scenario_worker, scens), total=len(scens)))
 
-    # write summary CSV ------------------------------------------------------
+    # write CSV --------------------------------------------------------------
     with args.outfile.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(CSV_HEADER)
-        for scn in data:
+        for d in data:
             for est in ("helmert", "lsvce", "lsvce_plus"):
-                w.writerow(metrics_to_row(est, scn))
+                w.writerow(metrics_to_row(est, d))
     print("Saved summary to", args.outfile)
 
-    # print nice table -------------------------------------------------------
     print_table(data)
