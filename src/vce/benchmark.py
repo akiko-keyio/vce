@@ -153,8 +153,10 @@ def scenario_worker(scn: Scenario) -> Dict[str, Any]:
 # CSV helpers ----------------------------------------------------------------
 
 
+
 def _csv_header() -> List[str]:
     cols = [
+
         "estimator",
         "m",
         "r_dim",
@@ -162,6 +164,7 @@ def _csv_header() -> List[str]:
         "block2",
         "block3",
     ]
+
     for pfx in (
         "bias",
         "sd",
@@ -183,6 +186,7 @@ def _csv_header() -> List[str]:
         ]
     )
     return cols
+
 
 
 def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
@@ -210,6 +214,7 @@ def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
     return row
 
 
+
 def scenarios_to_df(datas: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = [
         metrics_to_row(est, d)
@@ -221,6 +226,7 @@ def scenarios_to_df(datas: List[Dict[str, Any]]) -> pd.DataFrame:
 
 # ---------------------------------------------------------------------------
 # Pretty table ---------------------------------------------------------------
+
 
 
 def print_table(datas: List[Dict[str, Any]]) -> None:
@@ -271,6 +277,7 @@ if __name__ == "__main__":
         data = list(tqdm(pool.imap_unordered(scenario_worker, scens), total=len(scens)))
 
     scenarios_to_df(data).to_csv(args.outfile, index=False)
+
     print("Saved summary to", args.outfile)
 
     print_table(data)
