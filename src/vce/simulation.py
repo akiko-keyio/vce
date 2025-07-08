@@ -10,8 +10,6 @@ import scipy.stats
 import numpy as np
 
 from vce.core import HelmertVCE, LSVCE, LSVCEPlus
-from statsmodels.regression.mixed_linear_model import MixedLM
-import pandas as pd
 
 
 @dataclass
@@ -70,40 +68,6 @@ def simulate_y(
     return A @ b + rng.multivariate_normal(np.zeros(A.shape[0]), q)
 
 
-def run_statsmodels(
-    A: np.ndarray, y: np.ndarray,
-    q_blocks: Sequence[np.ndarray], block_sizes: Sequence[int]
-) -> tuple[np.ndarray, float, bool]:
-    m, r_dim = A.shape
-    df = pd.DataFrame(A, columns=[f"x{i}" for i in range(r_dim)])
-    df["y"] = y
-
-    # 1️⃣ 为每个观测生成唯一 id（或真实块 id）
-    df["obs"] = np.arange(m)
-
-    # 2️⃣ 建立三个方差组件；label_k 是“在第 k 块内观测序号”
-    vc = {}
-    cursor = 0
-    for k, size in enumerate(block_sizes):  # ← 用真实块大小
-
-        lab = np.full(m, "other", object)
-        lab[cursor:cursor+size] = [f"b{k}_{i}" for i in range(size)]
-        cursor += size
-        df[f"lab{k}"] = lab
-        vc[f"sigma{k}"] = f"0 + C(lab{k})"
-
-    # 3️⃣ 以“全部数据属于同一组”建模型，LBFGS + REML
-    model = MixedLM.from_formula(
-        "y ~ " + "+".join(df.columns[:r_dim]),
-        groups=np.ones(m), vc_formula=vc, data=df
-    )
-    res = model.fit(method="lbfgs", reml=True, maxiter=2000,
-                    warn_convergence=False)
-    sigmas = res.vcomp.values
-    return sigmas, res.mle_retvals["iterations"], res.converged
-
-
-
 def run_estimators(
     A: np.ndarray, q_blocks: Sequence[np.ndarray], y: np.ndarray
 ) -> Dict[str, Dict[str, np.ndarray | float | bool]]:
@@ -123,14 +87,6 @@ def run_estimators(
             "n_iter": float(est.n_iter_),
             "converged": bool(est.converged_),
         }
-    sig, n_iter, conv = run_statsmodels(A, y, q_blocks, scn.block_sizes)
-    out["mixedlm"] = {
-        "sigma": sig,
-        "cov_theo": np.full((len(q_blocks), len(q_blocks)), np.nan),
-        "chi2": np.nan,
-        "n_iter": n_iter,
-        "converged": conv,
-    }
     return out
 
 
@@ -142,7 +98,7 @@ def monte_carlo(scn: Scenario) -> Dict[str, Dict[str, np.ndarray]]:
     q_blocks = generate_q_blocks(scn.m, scn.block_sizes)
     results: Dict[str, Dict[str, list]] = {
         name: {"sigma": [], "cov_theo": [], "chi2": [], "n_iter": [], "converged": []}
-        for name in ("helmert", "lsvce", "lsvce_plus", "mixedlm")
+        for name in ("helmert", "lsvce", "lsvce_plus")
     }
     for _ in range(scn.n_trials):
         y = simulate_y(A, b, q_blocks, scn.sigma_true, rng)

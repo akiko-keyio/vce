@@ -27,9 +27,7 @@ def test_monte_carlo_bias_small() -> None:
         seed=123,
     )
     results = monte_carlo(scn)
-    for method, data in results.items():
-        if method == "mixedlm":
-            continue
+    for data in results.values():
         mean_est = data["sigma"].mean(axis=0)
         assert np.allclose(mean_est, scn.sigma_true, rtol=0.2)
 
