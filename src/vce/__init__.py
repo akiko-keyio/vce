@@ -13,5 +13,3 @@ __all__ = [
 ]
 
 
-def main() -> None:  # pragma: no cover
-    print("Hello from vce!")
