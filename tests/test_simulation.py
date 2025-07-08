@@ -19,7 +19,12 @@ def test_monte_carlo_shapes() -> None:
 
 def test_monte_carlo_bias_small() -> None:
     scn = Scenario(
-        m=60, r_dim=3, block_sizes=[20, 20, 20], sigma_true=[4.0, 1.5, 0.5], n_trials=20
+        m=60,
+        r_dim=3,
+        block_sizes=[20, 20, 20],
+        sigma_true=[4.0, 1.5, 0.5],
+        n_trials=20,
+        seed=123,
     )
     results = monte_carlo(scn)
     for method, data in results.items():

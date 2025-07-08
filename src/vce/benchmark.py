@@ -19,11 +19,12 @@ python benchmark.py -p 6 --trial-base 150  # deeper stats, 6 CPU cores
 from __future__ import annotations
 
 import argparse
-import csv
 import multiprocessing as mp
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+import pandas as pd
 
 import numpy as np
 from tqdm import tqdm
@@ -106,7 +107,7 @@ def calc_metrics(
             cov_mean = cov_theo_ok.mean(axis=0)
             var_ratio = var / np.diag(cov_mean)
             ci = 1.96 * np.sqrt(np.diag(cov_mean))
-            cover = ((true >= mean_est - ci) & (true <= mean_est + ci)).mean(axis=0)
+            cover = (true >= mean_est - ci) & (true <= mean_est + ci)
         else:
             var_ratio = cover = np.full_like(true, np.nan)
 
@@ -135,7 +136,7 @@ def calc_metrics(
 def scenario_worker(scn: Scenario) -> Dict[str, Any]:
     t0 = time.time()
     res = monte_carlo(scn)
-    met = calc_metrics(res, scn.sigma_true, scn.m, scn.r_dim)
+    met = calc_metrics(res, list(scn.sigma_true), scn.m, scn.r_dim)
     dt = time.time() - t0
 
     info: Dict[str, Any] = {
@@ -151,8 +152,11 @@ def scenario_worker(scn: Scenario) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # CSV helpers ----------------------------------------------------------------
 
-CSV_HEADER = (
-    [
+
+
+def _csv_header() -> List[str]:
+    cols = [
+
         "estimator",
         "m",
         "r_dim",
@@ -160,19 +164,29 @@ CSV_HEADER = (
         "block2",
         "block3",
     ]
-    + [
-        f"{pfx}{i + 1}"
-        for pfx in ("bias", "sd", "variance", "rmse", "mse", "ratio", "cov")
-        for i in range(3)
-    ]
-    + ["chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"]
-    + [
-        f"{pfx}{i + 1}"
-        for pfx in ("bias", "sd", "var", "rmse", "mse", "ratio", "cov")
-        for i in range(3)
-    ]
-    + ["chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"]
-)
+
+    for pfx in (
+        "bias",
+        "sd",
+        "variance",
+        "rmse",
+        "mse",
+        "var_ratio",
+        "cover95",
+    ):
+        cols.extend(f"{pfx}{i}" for i in range(1, 4))
+    cols.extend(
+        [
+            "chi2_p",
+            "iter_mean",
+            "iter_median",
+            "iter_max",
+            "fail_rate",
+            "scenario_runtime",
+        ]
+    )
+    return cols
+
 
 
 def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
@@ -200,40 +214,41 @@ def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
     return row
 
 
+
+def scenarios_to_df(datas: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = [
+        metrics_to_row(est, d)
+        for d in datas
+        for est in ("helmert", "lsvce", "lsvce_plus")
+    ]
+    return pd.DataFrame(rows, columns=_csv_header())
+
+
 # ---------------------------------------------------------------------------
 # Pretty table ---------------------------------------------------------------
 
 
-def print_table(datas: List[Dict[str, Any]]):
-    try:
-        from tabulate import tabulate
-    except ImportError:
-        print("(install `tabulate` for nicer tables)\n")
-        return
 
-    rows = []
-    for d in datas:
-        for est in ("helmert", "lsvce", "lsvce_plus", "mixedlm"):
-            m = d[est]
-            rows.append(
-                [
-                    est,
-                    d["m"],
-                    f"{m['bias'][0]:+.2f} ± {m['sd'][0]:.2f}",
-                    f"{m['bias'][1]:+.2f} ± {m['sd'][1]:.2f}",
-                    f"{m['bias'][2]:+.2f} ± {m['sd'][2]:.2f}",
-                    f"{m['chi2_p']:.2f}",
-                    f"{m['fail_rate'] * 100:.1f}%",
-                    f"{m['iter_mean']:.1f}",
-                ]
-            )
-    print(
-        tabulate(
-            rows,
-            headers=["est", "m", "σ1 (bias±sd)", "σ2", "σ3", "χ² p", "fail", "iter¯"],
-            tablefmt="github",
-        )
+def print_table(datas: List[Dict[str, Any]]) -> None:
+    df = scenarios_to_df(datas)
+    table = pd.DataFrame(
+        {
+            "est": df["estimator"],
+            "m": df["m"],
+            "σ1 (bias±sd)": [
+                f"{b:+.2f} ± {s:.2f}" for b, s in zip(df["bias1"], df["sd1"])
+            ],
+            "σ2": [f"{b:+.2f} ± {s:.2f}" for b, s in zip(df["bias2"], df["sd2"])],
+            "σ3": [f"{b:+.2f} ± {s:.2f}" for b, s in zip(df["bias3"], df["sd3"])],
+            "χ² p": df["chi2_p"].map(lambda x: f"{x:.2f}"),
+            "fail": (df["fail_rate"] * 100).map(lambda x: f"{x:.1f}%"),
+            "iter¯": df["iter_mean"].map(lambda x: f"{x:.1f}"),
+        }
     )
+    try:
+        print(table.to_markdown(index=False))
+    except Exception:
+        print(table.to_string(index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -261,13 +276,8 @@ if __name__ == "__main__":
     with mp.Pool(args.processes) as pool:
         data = list(tqdm(pool.imap_unordered(scenario_worker, scens), total=len(scens)))
 
-    # write CSV --------------------------------------------------------------
-    with args.outfile.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(CSV_HEADER)
-        for d in data:
-            for est in ("helmert", "lsvce", "lsvce_plus", "mixedlm"):
-                w.writerow(metrics_to_row(est, d))
+    scenarios_to_df(data).to_csv(args.outfile, index=False)
+
     print("Saved summary to", args.outfile)
 
     print_table(data)
