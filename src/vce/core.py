@@ -223,4 +223,3 @@ class LSVCEPlus(VCEBase):
                 N[k, j] = trace_of_product(Qk, Wy, P_perp, Ql, Wy, P_perp)
         self.N_inv = np.linalg.inv(N)
         return self.N_inv
-
