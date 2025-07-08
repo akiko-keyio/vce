@@ -10,6 +10,8 @@ import scipy.stats
 import numpy as np
 
 from vce.core import HelmertVCE, LSVCE, LSVCEPlus
+from statsmodels.regression.mixed_linear_model import MixedLM
+import pandas as pd
 
 
 @dataclass
@@ -68,6 +70,34 @@ def simulate_y(
     return A @ b + rng.multivariate_normal(np.zeros(A.shape[0]), q)
 
 
+def run_statsmodels(
+    A: np.ndarray, y: np.ndarray, q_blocks: Sequence[np.ndarray]
+) -> tuple[np.ndarray, float, bool]:
+    """Return REML estimates using :mod:`statsmodels`."""
+    m, r_dim = A.shape
+    df = pd.DataFrame(A, columns=[f"x{i}" for i in range(r_dim)])
+    df["y"] = y
+    vc: dict[str, str] = {}
+    for k, Qk in enumerate(q_blocks):
+        grp = (np.diag(Qk) > 0).astype(int)
+        df[f"grp{k}"] = grp
+        vc[f"sigma{k}"] = f"0 + grp{k}"
+    model = MixedLM.from_formula(
+        "y ~ " + " + ".join(df.columns[:r_dim]),
+        groups=pd.Series(np.ones(m)),
+        vc_formula=vc,
+        data=df,
+    )
+    try:
+        res = model.fit(reml=True, method="lbfgs", disp=False)
+        sigmas = np.array([res.vcomp[k] for k in range(len(q_blocks))])
+        converged = bool(res.converged)
+    except Exception:
+        sigmas = np.full(len(q_blocks), np.nan)
+        converged = False
+    return sigmas, float("nan"), converged
+
+
 def run_estimators(
     A: np.ndarray, q_blocks: Sequence[np.ndarray], y: np.ndarray
 ) -> Dict[str, Dict[str, np.ndarray | float | bool]]:
@@ -87,6 +117,14 @@ def run_estimators(
             "n_iter": float(est.n_iter_),
             "converged": bool(est.converged_),
         }
+    sig, n_iter, conv = run_statsmodels(A, y, q_blocks)
+    out["mixedlm"] = {
+        "sigma": sig,
+        "cov_theo": np.full((len(q_blocks), len(q_blocks)), np.nan),
+        "chi2": np.nan,
+        "n_iter": n_iter,
+        "converged": conv,
+    }
     return out
 
 
@@ -98,7 +136,7 @@ def monte_carlo(scn: Scenario) -> Dict[str, Dict[str, np.ndarray]]:
     q_blocks = generate_q_blocks(scn.m, scn.block_sizes)
     results: Dict[str, Dict[str, list]] = {
         name: {"sigma": [], "cov_theo": [], "chi2": [], "n_iter": [], "converged": []}
-        for name in ("helmert", "lsvce", "lsvce_plus")
+        for name in ("helmert", "lsvce", "lsvce_plus", "mixedlm")
     }
     for _ in range(scn.n_trials):
         y = simulate_y(A, b, q_blocks, scn.sigma_true, rng)

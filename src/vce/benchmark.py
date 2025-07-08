@@ -15,13 +15,13 @@ python benchmark.py              # quick run (trial‑base 75 × 4 scenarios)
 python benchmark.py -p 6 --trial-base 150  # deeper stats, 6 CPU cores
 ```
 """
+
 from __future__ import annotations
 
 import argparse
 import csv
 import multiprocessing as mp
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -33,12 +33,13 @@ from vce.simulation import Scenario, monte_carlo
 # ---------------------------------------------------------------------------
 # Scenario generator ---------------------------------------------------------
 
+
 def make_scenarios(trial_base: int) -> List[Scenario]:
     """Return a list of Scenario objects with balanced trial counts."""
     m_list = [12, 30, 60, 90]
     out: List[Scenario] = []
     for m in m_list:
-        r_dim = max(2, round(m / 3-20))
+        r_dim = max(2, round(m / 3 - 20))
         block = (m // 3, m // 3, m - 2 * (m // 3))
         trials = trial_base
         out.append(
@@ -53,13 +54,17 @@ def make_scenarios(trial_base: int) -> List[Scenario]:
         )
     return out
 
+
 # ---------------------------------------------------------------------------
 # Metric helpers -------------------------------------------------------------
 
-def calc_metrics(res: Dict[str, Dict[str, np.ndarray]],
-                 true_sigma: List[float], m: int, r_dim: int) -> Dict[str, Dict[str, Any]]:
+
+def calc_metrics(
+    res: Dict[str, Dict[str, np.ndarray]], true_sigma: List[float], m: int, r_dim: int
+) -> Dict[str, Dict[str, Any]]:
     """Compute extended metrics for each estimator, tolerate NaNs."""
     import scipy.stats
+
     true = np.asarray(true_sigma, float)
     dof = m - r_dim
     out: Dict[str, Dict[str, Any]] = {}
@@ -69,11 +74,20 @@ def calc_metrics(res: Dict[str, Dict[str, np.ndarray]],
         ok = conv & np.isfinite(sig).all(axis=1)
         if not ok.any():
             nan3 = [np.nan, np.nan, np.nan]
-            out[est] = dict(bias=nan3, sd=nan3, variance=nan3, rmse=nan3,
-                             mse=nan3, var_ratio=nan3, cover95=nan3,
-                             chi2_p=np.nan, iter_mean=np.nan,
-                             iter_median=np.nan, iter_max=np.nan,
-                             fail_rate=1.0)
+            out[est] = dict(
+                bias=nan3,
+                sd=nan3,
+                variance=nan3,
+                rmse=nan3,
+                mse=nan3,
+                var_ratio=nan3,
+                cover95=nan3,
+                chi2_p=np.nan,
+                iter_mean=np.nan,
+                iter_median=np.nan,
+                iter_max=np.nan,
+                fail_rate=1.0,
+            )
             continue
         sig_ok = sig[ok]
         cov_theo_ok = data["cov_theo"][ok]
@@ -98,9 +112,14 @@ def calc_metrics(res: Dict[str, Dict[str, np.ndarray]],
 
         chi2_p = float(1.0 - scipy.stats.chi2.cdf(chi2_vals.mean(), dof))
         out[est] = dict(
-            bias=bias.tolist(), sd=sd.tolist(), variance=var.tolist(),
-            rmse=rmse.tolist(), mse=mse.tolist(), var_ratio=var_ratio.tolist(),
-            cover95=cover.tolist(), chi2_p=chi2_p,
+            bias=bias.tolist(),
+            sd=sd.tolist(),
+            variance=var.tolist(),
+            rmse=rmse.tolist(),
+            mse=mse.tolist(),
+            var_ratio=var_ratio.tolist(),
+            cover95=cover.tolist(),
+            chi2_p=chi2_p,
             iter_mean=float(n_iter.mean()),
             iter_median=float(np.median(n_iter)),
             iter_max=float(n_iter.max()),
@@ -108,8 +127,10 @@ def calc_metrics(res: Dict[str, Dict[str, np.ndarray]],
         )
     return out
 
+
 # ---------------------------------------------------------------------------
 # Worker ---------------------------------------------------------------------
+
 
 def scenario_worker(scn: Scenario) -> Dict[str, Any]:
     t0 = time.time()
@@ -126,17 +147,32 @@ def scenario_worker(scn: Scenario) -> Dict[str, Any]:
     info.update(met)
     return info
 
+
 # ---------------------------------------------------------------------------
 # CSV helpers ----------------------------------------------------------------
 
-CSV_HEADER = [
-    "estimator", "m", "r_dim", "block1", "block2", "block3",
-] + [
-    f"{pfx}{i+1}" for pfx in ("bias", "sd", "variance", "rmse", "mse", "ratio", "cov") for i in range(3)
-] + [
-    "chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"
-] + [f"{pfx}{i+1}" for pfx in ("bias", "sd", "var", "rmse", "mse", "ratio", "cov") for i in range(3)] + [
-    "chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"]
+CSV_HEADER = (
+    [
+        "estimator",
+        "m",
+        "r_dim",
+        "block1",
+        "block2",
+        "block3",
+    ]
+    + [
+        f"{pfx}{i + 1}"
+        for pfx in ("bias", "sd", "variance", "rmse", "mse", "ratio", "cov")
+        for i in range(3)
+    ]
+    + ["chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"]
+    + [
+        f"{pfx}{i + 1}"
+        for pfx in ("bias", "sd", "var", "rmse", "mse", "ratio", "cov")
+        for i in range(3)
+    ]
+    + ["chi2_p", "iter_mean", "iter_med", "iter_max", "fail_rate", "scenario_runtime"]
+)
 
 
 def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
@@ -151,13 +187,22 @@ def metrics_to_row(est: str, scn: Dict[str, Any]) -> List[Any]:
             row.extend(v)
         else:
             row.append(v)
-    row.extend([
-        m["chi2_p"], m["iter_mean"], m["iter_median"], m["iter_max"], m["fail_rate"], scn["runtime"],
-    ])
+    row.extend(
+        [
+            m["chi2_p"],
+            m["iter_mean"],
+            m["iter_median"],
+            m["iter_max"],
+            m["fail_rate"],
+            scn["runtime"],
+        ]
+    )
     return row
+
 
 # ---------------------------------------------------------------------------
 # Pretty table ---------------------------------------------------------------
+
 
 def print_table(datas: List[Dict[str, Any]]):
     try:
@@ -168,28 +213,47 @@ def print_table(datas: List[Dict[str, Any]]):
 
     rows = []
     for d in datas:
-        for est in ("helmert", "lsvce", "lsvce_plus"):
+        for est in ("helmert", "lsvce", "lsvce_plus", "mixedlm"):
             m = d[est]
-            rows.append([
-                est, d["m"],
-                f"{m['bias'][0]:+.2f} ± {m['sd'][0]:.2f}",
-                f"{m['bias'][1]:+.2f} ± {m['sd'][1]:.2f}",
-                f"{m['bias'][2]:+.2f} ± {m['sd'][2]:.2f}",
-                f"{m['chi2_p']:.2f}",
-                f"{m['fail_rate']*100:.1f}%",
-                f"{m['iter_mean']:.1f}",
-            ])
-    print(tabulate(rows, headers=["est", "m", "σ1 (bias±sd)", "σ2", "σ3", "χ² p", "fail", "iter¯"], tablefmt="github"))
+            rows.append(
+                [
+                    est,
+                    d["m"],
+                    f"{m['bias'][0]:+.2f} ± {m['sd'][0]:.2f}",
+                    f"{m['bias'][1]:+.2f} ± {m['sd'][1]:.2f}",
+                    f"{m['bias'][2]:+.2f} ± {m['sd'][2]:.2f}",
+                    f"{m['chi2_p']:.2f}",
+                    f"{m['fail_rate'] * 100:.1f}%",
+                    f"{m['iter_mean']:.1f}",
+                ]
+            )
+    print(
+        tabulate(
+            rows,
+            headers=["est", "m", "σ1 (bias±sd)", "σ2", "σ3", "χ² p", "fail", "iter¯"],
+            tablefmt="github",
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Main -----------------------------------------------------------------------
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--trial-base", type=int, default=10000,
-                    help="Base trial count for smallest m (default 75)")
-    ap.add_argument("-p", "--processes", type=int, default=mp.cpu_count(),
-                    help="Worker processes (default=min(4,cpu))")
+    ap.add_argument(
+        "--trial-base",
+        type=int,
+        default=10000,
+        help="Base trial count for smallest m (default 75)",
+    )
+    ap.add_argument(
+        "-p",
+        "--processes",
+        type=int,
+        default=mp.cpu_count(),
+        help="Worker processes (default=min(4,cpu))",
+    )
     ap.add_argument("--outfile", type=Path, default="vce_lsummary.csv")
     args = ap.parse_args()
 
@@ -202,7 +266,7 @@ if __name__ == "__main__":
         w = csv.writer(f)
         w.writerow(CSV_HEADER)
         for d in data:
-            for est in ("helmert", "lsvce", "lsvce_plus"):
+            for est in ("helmert", "lsvce", "lsvce_plus", "mixedlm"):
                 w.writerow(metrics_to_row(est, d))
     print("Saved summary to", args.outfile)
 
