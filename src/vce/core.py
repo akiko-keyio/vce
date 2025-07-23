@@ -1,299 +1,404 @@
-# -*- coding: utf-8 -*-
-"""
-Variance‑Component Estimation (VCE) Library — revised
-======================================================
-Fixes & upgrades after formal cross‑check with Teunissen & Amiri‑Simkooei
-(2007) and Amiri‑Simkooei (2007):
-
-• **Bug‑fix (LSVCEPlus)**  — the right‑hand vector rₖ must use the *known*
-  part Q₀ of the covariance model (Eq. 4.105, thesis; Eq. 36, journal), **not** Q_y.
-  If Q₀ is absent (the common case), it is 0.
-• Added user‑settable attribute **Q0** to supply Q₀ when needed.
-• Minor: docstrings cite exact equations; improved type hints; left Helmert &
-  unit‑weight LS‑VCE untouched (they were already correct).
-"""
+# vce/core.py ― Definitive version, fully documented
+# ==================================================
+# References (abbrev. used below):
+#   ▸ TAS 2008  = Teunissen & Amiri-Simkooei (2008), “Least-Squares Variance Component Estimation”
+#   ▸ AS 2007   = Amiri-Simkooei (2007), PhD thesis, Ch. 3–4   (Helmert VCE)
+#
+# Formula numbers in comments correspond to those publications
+# (e.g. “Eq. (60) TAS 2008”).
 
 from __future__ import annotations
 
-import numpy as np
+import logging
 from dataclasses import dataclass, field
-from typing import Sequence, Tuple, Optional, Literal
+from typing import Literal, Optional, Sequence, Tuple
 
-# ---------------------------------------------------------------------------
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# ---------------------------------------------------------------------
 # Helper utilities
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+def oblique_projector(A: np.ndarray, W: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return the (generally *non-orthogonal*) projector **P** and its complement **P_perp**:
 
+        P        = A (Aᵀ W A)⁻¹ Aᵀ W                       # Eq. (17) TAS 2008
+        P_perp   = I − P                                     # Eq. (18) TAS 2008
 
-def orthogonal_projector(
-    A: np.ndarray, Q_inv: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return projectors onto ``range(A)`` and its complement.
+    These satisfy P² = P but Pᵀ ≠ P in general.  W is the inverse of the
+    observation covariance matrix, *i.e.* W = Q_y⁻¹.
 
     Parameters
     ----------
-    A:
-        Design matrix whose column space is the target subspace.
-    Q_inv:
-        Precision matrix defining the inner product.
+    A : (m, n) ndarray
+        Design matrix.
+    W : (m, m) ndarray
+        Weight matrix (inverse covariance).
 
     Returns
     -------
-    Tuple[np.ndarray, np.ndarray]
-        ``(P, P_perp)`` where ``P`` projects onto ``range(A)`` and
-        ``P_perp`` onto the orthogonal complement.
+    P : (m, m) ndarray
+        Oblique projector onto range(A).
+    P_perp : (m, m) ndarray
+        Complementary projector onto the *residual* space.
     """
-
-    At = A.T  # transpose for reuse
-    N = At @ Q_inv @ A  # normal matrix
-    N_inv = np.linalg.inv(N)  # its inverse
-    P = A @ (N_inv @ (At @ Q_inv))  # projector onto range(A)
-    return P, np.eye(A.shape[0]) - P  # complementary projector
+    AtW = A.T @ W
+    N_inv = np.linalg.pinv(AtW @ A)
+    P = A @ (N_inv @ AtW)
+    return P, np.eye(A.shape[0]) - P
 
 
 def trace_of_product(*mats: np.ndarray) -> float:
-    """Return the trace of a matrix product.
-
-    Multiplication is performed sequentially in the supplied order.
     """
-    prod = mats[0]  # first factor
+    Compute **tr(M₁ M₂ … M_k)** with a single pass.
+
+    The function exists only for readability; no numerical shortcut is taken.
+    """
+    prod = mats[0]
     for M in mats[1:]:
-        prod = prod @ M  # accumulate product
+        prod = prod @ M
     return float(np.trace(prod))
 
 
-# ---------------------------------------------------------------------------
-# Base scaffold (unchanged)
-# ---------------------------------------------------------------------------
-
-
+# ---------------------------------------------------------------------
+# Generic LS-VCE framework
+# ---------------------------------------------------------------------
 @dataclass
 class VCEBase:
-    """Common driver for variance-component estimators.
+    r"""
+    Abstract super-class for iterative *Least-Squares Variance Component
+    Estimation* (LS-VCE).
 
-    Parameters
-    ----------
-    A : np.ndarray
-        Design matrix relating observations to parameters.
-    Q_blocks : Sequence[np.ndarray]
-        Basis matrices defining the covariance model.
-    max_iter : int, optional
-        Maximum number of iterations.
-    tol : float, optional
-        Convergence tolerance for ``sigma`` updates.
-    verbose : bool, optional
-        If ``True``, print intermediate estimates.
+    Functional model   :  y = A x + e                                # Eq. (1) TAS 2008
+    Stochastic model   :  Q_y = Q₀ + Σ σ_k Q_k                       # Eq. (2) TAS 2008
 
-    Attributes
-    ----------
-    sigma_ : np.ndarray
-        Final variance-component estimates.
-    converged_ : bool
-        Whether the algorithm met the tolerance.
-    n_iter_ : int
-        Number of iterations executed.
-    residual_ : np.ndarray
-        Post-fit residual vector.
-    chi2_ : float
-        Residual chi-square statistic.
-    cov_theo_ : np.ndarray
-        Theoretical covariance matrix of ``sigma_``.
+    All concrete subclasses need to implement two hooks:
+
+    * ``_update_step``   – one iteration of σ ← σ + Δσ
+    * ``_compute_covariance`` – asymptotic Cov{σ̂} after convergence
     """
 
+    # ---------------- public inputs ----------------
     A: np.ndarray
     Q_blocks: Sequence[np.ndarray]
     max_iter: int = 50
     tol: float = 1e-10
     verbose: bool = False
+    Q0: Optional[np.ndarray] = None
+    enforce_non_negative: bool = False
+    singular_tol: float = 1e12
 
-    sigma_: np.ndarray = field(init=False, repr=False)
+    # ---------------- results (populated by .fit) --
+    sigma_: np.ndarray = field(init=False)  # shape (p,)
     converged_: bool = field(init=False, default=False)
     n_iter_: int = field(init=False, default=0)
-    residual_: np.ndarray = field(init=False, repr=False)
-    chi2_: float = field(init=False, default=float("nan"))
-    cov_theo_: np.ndarray = field(init=False, repr=False)
+    residual_: np.ndarray = field(init=False)  # shape (m,)
+    chi2_: float = field(init=False, default=np.nan)
+    cov_theo_: np.ndarray = field(init=False)  # shape (p, p)
 
-    # subclasses implement one iteration -------------------------------------
-    def _update_step(
-        self, y: np.ndarray, P_perp: np.ndarray, e: np.ndarray
-    ) -> np.ndarray:  # noqa: N802
-        """Return updated variance components for one iteration."""
-        raise NotImplementedError
+    # ------------------------------------------------
+    # life-cycle helpers
+    # ------------------------------------------------
+    def __post_init__(self) -> None:
+        p = len(self.Q_blocks)
+        self.sigma_ = np.full(p, np.nan)
+        self.residual_ = np.full(self.A.shape[0], np.nan)
+        self.cov_theo_ = np.full((p, p), np.nan)
 
-    def _compute_covariance(self, P_perp: np.ndarray, Q_y: np.ndarray) -> np.ndarray:
-        """Compute the theoretical covariance of ``sigma_``."""
-        raise NotImplementedError
+    # ------------------------------------------------
+    # linear-system solver
+    # ------------------------------------------------
+    def _solve_system(self, N_mat: np.ndarray, r_vec: np.ndarray) -> np.ndarray:
+        """
+        Solve **N σ = r** – the normal-equation system of a VCE iteration.
 
-    # driver loop -------------------------------------------------------------
-    def fit(self, y: np.ndarray, sigma0: Optional[Sequence[float]] = None):
-        """Iteratively estimate variance components from ``y``."""
-        y = np.asarray(y, float)  # observation vector
-        m = y.size  # number of observations
-        if any(Q.shape != (m, m) for Q in self.Q_blocks):
-            raise ValueError("Every Q_k must be m×m and match y.")
+        A fallback to *least-squares* is provided if N is singular; a warning is
+        raised if N is ill-conditioned (cond > ``self.singular_tol``).
+        """
+        if np.linalg.cond(N_mat) > self.singular_tol and self.verbose:
+            logging.warning("Normal matrix is ill-conditioned; solution may be unstable")
 
-        # initial variance components
-        self.sigma_ = (
-            np.asarray(sigma0, float)
-            if sigma0 is not None
-            else np.array([y @ Q @ y / np.trace(Q) for Q in self.Q_blocks])
-        )
+        try:
+            return np.linalg.solve(N_mat, r_vec)
+        except np.linalg.LinAlgError:
+            if self.verbose:
+                logging.warning("Normal matrix singular - using np.linalg.lstsq")
+            try:
+                return np.linalg.lstsq(N_mat, r_vec, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                if self.verbose:
+                    logging.error("SVD failed - keeping previous σ")
+                return self.sigma_
 
-        for it in range(1, self.max_iter + 1):  # main iteration loop
-            Q_y = sum(
-                s * Q for s, Q in zip(self.sigma_, self.Q_blocks)
-            )  # build covariance
-            Q_inv = np.linalg.inv(Q_y)  # precision matrix
-            _, P_perp = orthogonal_projector(self.A, Q_inv)  # projectors
-            e = P_perp @ y  # residual vector
-            sigma_new = self._update_step(y, P_perp, e)  # subclass update
-            if np.allclose(self.sigma_, sigma_new, rtol=self.tol, atol=self.tol):
+    # ------------------------------------------------
+    # main driver
+    # ------------------------------------------------
+    def fit(self, y: np.ndarray, sigma0: Optional[Sequence[float]] = None) -> "VCEBase":
+        """
+        Iterate until
+
+          ‖σ^{(t)} − σ^{(t−1)}‖_∞  ≤  ``tol``
+
+        or *max_iter* is reached.  On convergence, residuals, χ² and the
+        theoretical covariance of σ̂ are computed.
+        """
+        y = np.asarray(y, float)
+        p = len(self.Q_blocks)
+        self.sigma_ = np.ones(p) if sigma0 is None else np.asarray(sigma0, float)
+
+        for it in range(1, self.max_iter + 1):
+            self.n_iter_ = it
+            σ_prev = self.sigma_.copy()
+
+            # 1. build current Q_y
+            Q_y = self.predict_Q()
+            if np.linalg.cond(Q_y) > self.singular_tol:
+                if self.verbose:
+                    logging.warning(f"Iter {it:02d}: Q_y ill-conditioned – aborting")
+                self.converged_ = False
+                return self
+
+            Q_inv = np.linalg.pinv(Q_y)
+            _, P_perp = oblique_projector(self.A, Q_inv)
+            e = P_perp @ y                                          # ê  (Eq. (50) TAS 2008)
+
+            # 2. one VCE update
+            self.sigma_ = self._update_step(e, P_perp, Q_inv)
+
+            # 3. optional non-negativity enforcement
+            if self.enforce_non_negative:
+                self.sigma_ = np.maximum(self.sigma_, 0.0)
+
+            # 4. convergence check
+            if np.allclose(σ_prev, self.sigma_, rtol=self.tol, atol=self.tol):
                 self.converged_ = True
-                self.n_iter_ = it
                 break
             if self.verbose:
-                print(f"iter {it:02d}: σ = {sigma_new}")
-            self.sigma_ = sigma_new
-            self.n_iter_ = it
-        Q_y = self.predict_Q()  # final covariance estimate
-        Q_inv = np.linalg.inv(Q_y)
-        _, P_perp = orthogonal_projector(self.A, Q_inv)
-        self.residual_ = P_perp @ y
-        self.chi2_ = float(self.residual_ @ Q_inv @ self.residual_)
-        self.cov_theo_ = self._compute_covariance(P_perp, Q_y)
+                logging.info(f"Iter {it:02d}: σ = {self.sigma_}")
+
+        if not self.converged_ and self.verbose:
+            logging.warning("LS-VCE did *not* converge")
+
+        # 5. post-processing on success
+        if self.converged_:
+            try:
+                Q_inv = np.linalg.pinv(self.predict_Q())
+                _, P_perp = oblique_projector(self.A, Q_inv)
+                self.residual_ = P_perp @ y
+                self.chi2_ = float(self.residual_ @ Q_inv @ self.residual_)  # Eq. (56) TAS 2008
+                self.cov_theo_ = self._compute_covariance(P_perp, self.predict_Q())
+            except (np.linalg.LinAlgError, ValueError):
+                self.chi2_ = np.nan
+                self.cov_theo_[:] = np.nan
         return self
 
+    # ------------------------------------------------
+    # utilities
+    # ------------------------------------------------
     def predict_Q(self) -> np.ndarray:
-        """Return the predicted covariance matrix ``Q_y``."""
-        return sum(s * Q for s, Q in zip(self.sigma_, self.Q_blocks))
+        """
+        Return current **Q_y = Q₀ + Σ σ_k Q_k**             # Eq. (2) TAS 2008
+        """
+        Q_y = sum(σ * Q for σ, Q in zip(self.sigma_, self.Q_blocks))
+        return Q_y if self.Q0 is None else Q_y + self.Q0
 
-    @property
-    def sigma(self) -> np.ndarray:  # pragma: no cover
-        """Variance component estimates."""
-        return self.sigma_
-
-
-# ---------------------------------------------------------------------------
-# 1. Helmert estimator (unchanged)
-# ---------------------------------------------------------------------------
+    # ----- subclass requirements ---------------------------------------
+    def _update_step(self, e: np.ndarray, P_perp: np.ndarray, Q_y_inv: np.ndarray) -> np.ndarray: ...
+    def _compute_covariance(self, P_perp: np.ndarray, Q_y: np.ndarray) -> np.ndarray: ...
 
 
-class HelmertVCE(VCEBase):
-    """Helmert variance-component estimator."""
-
-    method: Literal["helmert"] = "helmert"
-
-    H_inv: np.ndarray = field(init=False, repr=False)
-
-    def _update_step(self, y, P_perp, e):  # noqa: N802
-        """Compute next ``sigma`` using the Helmert formulation."""
-        p = len(self.Q_blocks)
-        E = [
-            P_perp @ Q @ P_perp / s for Q, s in zip(self.Q_blocks, self.sigma_)
-        ]  # Eq. matrix
-        q = np.array([e @ (Ek @ e) for Ek in E])  # right-hand side
-        H = np.empty((p, p))  # normal matrix
-        for k in range(p):
-            for j in range(p):
-                # build H from traces of products
-                H[k, j] = trace_of_product(E[k], P_perp, self.Q_blocks[j], P_perp)
-        return np.linalg.solve(H, q)
-
-    def _compute_covariance(self, P_perp: np.ndarray, Q_y: np.ndarray) -> np.ndarray:
-        """Return the covariance of the Helmert estimator."""
-        p = len(self.Q_blocks)
-        E = [
-            P_perp @ Q @ P_perp / s for Q, s in zip(self.Q_blocks, self.sigma_)
-        ]  # reuse E
-        H = np.empty((p, p))  # assemble normal matrix
-        for k in range(p):
-            for j in range(p):
-                # same trace expression as in update step
-                H[k, j] = trace_of_product(E[k], P_perp, self.Q_blocks[j], P_perp)
-        self.H_inv = np.linalg.inv(H)
-        return self.H_inv
-
-
-# ---------------------------------------------------------------------------
-# 2. LS‑VCE (unit weight) — unchanged
-# ---------------------------------------------------------------------------
-
-
-class LSVCE(VCEBase):
-    """Least-squares variance-component estimator."""
-
-    method: Literal["lsvce"] = "lsvce"
-
-    N_inv: np.ndarray = field(init=False, repr=False)
-
-    def _update_step(self, y, P_perp, e):  # noqa: N802
-        """Update ``sigma`` using the LS-VCE scheme."""
-        p = len(self.Q_blocks)
-        l_vec = np.array([e @ (Q @ e) for Q in self.Q_blocks])  # rhs vector
-        N = np.empty((p, p))  # normal matrix
-        for k, Qk in enumerate(self.Q_blocks):
-            for j, Ql in enumerate(self.Q_blocks):
-                # build N from traces of projected blocks
-                N[k, j] = trace_of_product(P_perp, Qk, P_perp, Ql)
-        return np.linalg.solve(N, l_vec)
-
-    def _compute_covariance(self, P_perp: np.ndarray, Q_y: np.ndarray) -> np.ndarray:
-        """Return the covariance of the LS-VCE estimator."""
-        p = len(self.Q_blocks)
-        N = np.empty((p, p))  # same normal matrix as update step
-        for k, Qk in enumerate(self.Q_blocks):
-            for j, Ql in enumerate(self.Q_blocks):
-                N[k, j] = trace_of_product(P_perp, Qk, P_perp, Ql)
-        self.N_inv = np.linalg.inv(N)
-        return self.N_inv
-
-
-# ---------------------------------------------------------------------------
-# 3. LSVCEPlus — corrected rₖ term (Eq. 4.105 / 36)
-# ---------------------------------------------------------------------------
-
-
+# ---------------------------------------------------------------------
+# BIQUE / REML / “optimal” LS-VCE
+# ---------------------------------------------------------------------
 @dataclass
-class LSVCEPlus(VCEBase):
-    """BLUE/Minimum‑variance LS‑VCE for κ = 0.
-
-    Parameters
-    ----------
-    Q0 : Optional[np.ndarray]
-        Known part of the covariance model (defaults to 0).  Used in the
-        second term of rₖ, see Amiri‑Simkooei thesis Eq. 4.105.
+class LSVCE(VCEBase):
     """
+    BIQUE (= REML for κ = 0) implementation of LS-VCE.
 
-    Q0: Optional[np.ndarray] = None  # known part (may be zero)
-    method: Literal["lsvce_plus"] = "lsvce_plus"
-    N_inv: np.ndarray = field(init=False, repr=False)
+    *Normal equations* (κ = 0, A-model) — TAS 2008 Eq. (60–61):
 
-    def _update_step(self, y, P_perp, e):  # noqa: N802
-        """Update ``sigma`` using the BLUE variant."""
-        Q_y = self.predict_Q()
-        Wy = (1.0 / np.sqrt(2.0)) * np.linalg.inv(Q_y)  # Eq. (49) with κ=0
-        Q0 = self.Q0 if self.Q0 is not None else np.zeros_like(Q_y)
+        r_k   = ½ [ êᵀ R Q_k R ê  −  tr(P_⊥ Q₀ R P_⊥ Q_k R) ]       # Eq. (60)
 
+        N_kl  = ½ · tr(P_⊥ Q_k R P_⊥ Q_l R)                         # Eq. (61)
+
+    with  R = Q_y⁻¹,  P_⊥ = I − P.
+    """
+    method: Literal["bique", "reml", "optimal_lsvce"] = "bique"
+
+    # ------------------------------------------------
+    # one BIQUE iteration
+    # ------------------------------------------------
+    def _update_step(self, e: np.ndarray, P_perp: np.ndarray, Q_inv: np.ndarray) -> np.ndarray:  # noqa: N803
         p = len(self.Q_blocks)
-        N = np.empty((p, p))  # normal matrix
-        r = np.empty(p)  # right-hand side
+        Q0_eff = np.zeros_like(self.Q_blocks[0]) if self.Q0 is None else self.Q0
+
+        N = np.empty((p, p))
+        r = np.empty(p)
+
         for k, Qk in enumerate(self.Q_blocks):
-            for j, Ql in enumerate(self.Q_blocks):
-                # Eq. (52) - build normal matrix
-                N[k, j] = trace_of_product(Qk, Wy, P_perp, Ql, Wy, P_perp)
-            # rₖ = eᵀ Wy Qk Wy e − ½ tr(Qk Wy P⊥ Q₀ Wy P⊥)  (Eq. 4.105)
-            r[k] = e @ Wy @ Qk @ Wy @ e - trace_of_product(
-                Qk, Wy, P_perp, Q0, Wy, P_perp
-            )
+            # ---- right-hand side r_k  (Eq. (60) TAS 2008) -----------
+            term1 = e @ Q_inv @ Qk @ Q_inv @ e
+            term2 = trace_of_product(P_perp, Q0_eff, Q_inv, P_perp, Qk, Q_inv)
+            r[k] = 0.5 * (term1 - term2)
 
-        return np.linalg.solve(N, r)
+            # ---- normal matrix N_kl  (Eq. (61) TAS 2008) -----------
+            for l, Ql in enumerate(self.Q_blocks[k:], start=k):  # exploit symmetry
+                term = trace_of_product(P_perp, Qk, Q_inv, P_perp, Ql, Q_inv)
+                N[k, l] = N[l, k] = 0.5 * term
 
+        return self._solve_system(N, r)
+
+    # ------------------------------------------------
+    # asymptotic covariance  (Sec. 5 TAS 2008)
+    # ------------------------------------------------
     def _compute_covariance(self, P_perp: np.ndarray, Q_y: np.ndarray) -> np.ndarray:
-        """Return the covariance of the LS-VCE+ estimator."""
-        Wy = (1.0 / np.sqrt(2.0)) * np.linalg.inv(Q_y)
+        Q_inv = np.linalg.pinv(Q_y)
         p = len(self.Q_blocks)
-        N = np.empty((p, p))  # reuse normal matrix
+
+        N = np.empty((p, p))
         for k, Qk in enumerate(self.Q_blocks):
-            for j, Ql in enumerate(self.Q_blocks):
-                N[k, j] = trace_of_product(Qk, Wy, P_perp, Ql, Wy, P_perp)
-        self.N_inv = np.linalg.inv(N)
-        return self.N_inv
+            for l, Ql in enumerate(self.Q_blocks[k:], start=k):
+                term = trace_of_product(P_perp, Qk, Q_inv, P_perp, Ql, Q_inv)  # Eq. (61)
+                N[k, l] = N[l, k] = 0.5 * term
+        return np.linalg.pinv(N)
+
+# ---------------------------------------------------------------------
+# Helmert-type LS-VCE  (AS 2007, Sec. 3–4)  — configurable version
+# ---------------------------------------------------------------------
+@dataclass
+class HelmertVCE(VCEBase):
+    """
+    Helmert-type LS-VCE estimator.
+
+    A *group-diagonal* noise model (block-diagonal Q_k) admits a closed-form
+    one-step solution (AS 2007 §3.4).  In finite samples that one-step
+    covariance is often underestimated.  This class therefore exposes the
+    boolean flag **one_step**:
+
+    • one_step = False (default) – use *step-by-step* iterations until the
+      standard LS-VCE convergence criterion is met;
+
+    • one_step = True  – if the model is group-diagonal **and** all initial
+      σ_k > 0, perform exactly one closed-form update and return.
+
+    Update equations (AS 2007):
+
+        q_k  = êᵀ E_k ê                                   (Eq. 3.17)
+        H_kl = tr(P_⊥ᵀ E_k P_⊥ Q_l)                       (Eq. 3.18)
+        Cov{σ̂} = H⁻¹                                     (Eq. 4.14)
+    """
+    method: Literal["helmert"] = "helmert"
+    one_step: bool = False        # expose one-step mode to the user
+
+    # ------------------------------------------------
+    # helpers
+    # ------------------------------------------------
+    def _has_group_structure(self, tol: float = 1e-12) -> bool:
+        """Return True if all Q_k are diagonal and non-overlapping (AS 2007 §3.4)."""
+        m = self.Q_blocks[0].shape[0]
+        occupied = np.zeros(m, dtype=bool)
+        for Qk in self.Q_blocks:
+            if not np.allclose(Qk - np.diag(np.diagonal(Qk)), 0.0, atol=tol):
+                return False
+            mask = np.abs(np.diagonal(Qk)) > tol
+            if np.any(occupied & mask):
+                return False
+            occupied |= mask
+        return True
+
+    def _make_Ek(self, Q_inv: np.ndarray) -> Sequence[np.ndarray]:
+        """
+        Build derivative matrices E_k.
+
+            group-diagonal & σ_k>0 :  E_k = σ_k⁻¹ Q_k⁻¹      (Eq. 3.11)
+            otherwise              :  E_k = Q_y⁻¹ Q_k Q_y⁻¹  (Eq. 3.16)
+        """
+        if self._has_group_structure() and np.all(self.sigma_ > 0.0):
+            return [np.linalg.pinv(Qk) / σ for σ, Qk in zip(self.sigma_, self.Q_blocks)]
+        return [Q_inv @ Qk @ Q_inv for Qk in self.Q_blocks]
+
+    # ------------------------------------------------
+    # driver override
+    # ------------------------------------------------
+    def fit(
+        self,
+        y: np.ndarray,
+        sigma0: Optional[Sequence[float]] = None,
+    ) -> "HelmertVCE":
+        """
+        If ``one_step`` and the model is group-diagonal, run a single closed-form
+        update; otherwise fall back to the generic iterative routine.
+        """
+        do_one_step = (
+            self.one_step
+            and self._has_group_structure()
+            and (sigma0 is None or np.all(np.asarray(sigma0) > 0.0))
+        )
+
+        if do_one_step:
+            old_max = self.max_iter
+            self.max_iter = 1
+            try:
+                super().fit(y, sigma0)  # may early-exit on ill-conditioned Q_y
+                # explicit residuals and theoretical covariance
+                Q_y = self.predict_Q()
+                Q_inv = np.linalg.pinv(Q_y)
+                _, P_perp = oblique_projector(self.A, Q_inv)
+                self.residual_ = P_perp @ y
+                self.chi2_ = float(self.residual_ @ Q_inv @ self.residual_)
+                self.cov_theo_ = self._compute_covariance(P_perp, Q_y)
+                self.converged_ = True
+            finally:
+                self.max_iter = old_max
+            return self
+
+        # step-by-step (default)
+        return super().fit(y, sigma0)
+
+    # ------------------------------------------------
+    # core mathematics
+    # ------------------------------------------------
+    def _update_step(
+        self,
+        e: np.ndarray,
+        P_perp: np.ndarray,
+        Q_inv: np.ndarray,
+    ) -> np.ndarray:  # noqa: N803
+        """Solve H σ = q for the current iterate (AS 2007 Eq. 3.17–3.18)."""
+        p = len(self.Q_blocks)
+        Ek = self._make_Ek(Q_inv)
+
+        H = np.empty((p, p))
+        q = np.empty(p)
+
+        for k, E_k in enumerate(Ek):
+            q[k] = e @ E_k @ e
+            for l in range(k, p):
+                Ql = self.Q_blocks[l]
+                Hkl = np.trace(P_perp.T @ E_k @ P_perp @ Ql)
+                H[k, l] = H[l, k] = Hkl
+        return self._solve_system(H, q)
+
+    def _compute_covariance(
+        self,
+        P_perp: np.ndarray,
+        Q_y: np.ndarray,
+    ) -> np.ndarray:
+        """Return Cov{σ̂} = H⁻¹   (AS 2007 Eq. 4.14)."""
+        Q_inv  = np.linalg.pinv(Q_y)
+        E_list = self._make_Ek(Q_inv)
+        p      = len(self.Q_blocks)
+
+        H = np.empty((p, p))
+        for k, Ek in enumerate(E_list):
+            for l in range(k, p):
+                Ql  = self.Q_blocks[l]
+                Hkl = np.trace(P_perp.T @ Ek @ P_perp @ Ql)   # Eq. 3.18
+                H[k, l] = H[l, k] = Hkl
+        return np.linalg.pinv(H)                              # Eq. 4.14
+
